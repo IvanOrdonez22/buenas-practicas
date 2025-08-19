@@ -1,4 +1,11 @@
 import { NextResponse, NextRequest } from 'next/server';
+import postgres from 'postgres';
+
+// Database connection configuration
+const DB_CONFIG = {
+  connectionString: 'postgresql://postgres.gymwtqibtytjbhqteoyt:ivferkiro112206@aws-1-us-east-2.pooler.supabase.com:6543/postgres',
+  tableName: 'submissions'
+};
 
 class DataValidator {
   static checkRequiredFields(payload: any) {
@@ -8,7 +15,7 @@ class DataValidator {
     if (missingFields.length > 0) {
       return NextResponse.json(
         { 
-          validationError: 'Campos obligatorios faltantes',
+          error: 'Missing required fields',
           missing: missingFields,
           required: mandatoryFields 
         },
@@ -36,9 +43,9 @@ class DataValidator {
     if (typeMismatches.length > 0) {
       return NextResponse.json(
         {
-          validationError: 'Tipos de datos incorrectos',
+          error: 'Invalid data types',
           details: typeMismatches,
-          message: 'Todos los campos deben ser texto'
+          message: 'All fields must be strings'
         },
         { status: 400 }
       );
@@ -53,7 +60,7 @@ class DataValidator {
     if (titleLength < 5) {
       return NextResponse.json(
         {
-          validationError: 'Título demasiado corto',
+          error: 'Title too short',
           currentLength: titleLength,
           minimumRequired: 5,
           providedValue: titleValue
@@ -65,7 +72,7 @@ class DataValidator {
     if (titleLength > 100) {
       return NextResponse.json(
         {
-          validationError: 'Título excede longitud máxima',
+          error: 'Title exceeds maximum length',
           currentLength: titleLength,
           maximumAllowed: 100,
           providedValue: titleValue
@@ -84,7 +91,7 @@ class DataValidator {
     if (descLength === 0) {
       return NextResponse.json(
         {
-          validationError: 'Descripción no puede estar vacía',
+          error: 'Description cannot be empty',
           providedValue: descContent
         },
         { status: 400 }
@@ -94,7 +101,7 @@ class DataValidator {
     if (descLength < 5) {
       return NextResponse.json(
         {
-          validationError: 'Descripción insuficiente',
+          error: 'Description too short',
           currentCharacters: descLength,
           requiredMinimum: 5,
           missingCharacters: 5 - descLength
@@ -106,7 +113,7 @@ class DataValidator {
     if (descLength > 1000) {
       return NextResponse.json(
         {
-          validationError: 'Descripción demasiado extensa',
+          error: 'Description too long',
           currentCharacters: descLength,
           characterLimit: 1000,
           excessCharacters: descLength - 1000
@@ -127,31 +134,31 @@ class DataValidator {
     };
 
     if (!namePatterns.capitalStart.test(authorName)) {
-      validationIssues.push('Debe comenzar con mayúscula');
+      validationIssues.push('Must start with capital letter');
     }
 
     if (!namePatterns.validCharacters.test(authorName)) {
-      validationIssues.push('Contiene caracteres no permitidos');
+      validationIssues.push('Contains invalid characters');
     }
 
     if (!namePatterns.nameFormat.test(authorName)) {
-      validationIssues.push('Formato de nombre incorrecto');
+      validationIssues.push('Invalid name format');
     }
 
     if (authorName.replace(/[^a-záéíóúñü]/gi, '').length < 2) {
-      validationIssues.push('Nombre muy corto');
+      validationIssues.push('Name too short');
     }
 
     if (validationIssues.length > 0) {
       return NextResponse.json(
         {
-          validationError: 'Nombre de autor inválido',
+          error: 'Invalid author name',
           detectedIssues: validationIssues,
           providedName: authorName,
-          recommendations: [
-            'Usar mayúscula inicial',
-            'Solo letras, espacios, guiones y apóstrofes',
-            'Ejemplo: "Ana-María López"'
+          suggestions: [
+            'Use proper capitalization',
+            'Only use letters, spaces, hyphens, and apostrophes',
+            'Example: "John-Doe Smith"'
           ]
         },
         { status: 400 }
@@ -162,10 +169,42 @@ class DataValidator {
   }
 }
 
+class DatabaseService {
+  private sql: any;
+
+  constructor() {
+    this.sql = postgres(DB_CONFIG.connectionString);
+  }
+
+  async storeSubmission(data: { title: string; description: string; author: string; }) {
+    try {
+      const result = await this.sql`
+        INSERT INTO ${this.sql(DB_CONFIG.tableName)} 
+          (title, description, author, created_at)
+        VALUES 
+          (${data.title}, ${data.description}, ${data.author}, NOW())
+        RETURNING id
+      `;
+      
+      return result[0].id;
+    } catch (error) {
+      console.error('Database insertion error:', error);
+      throw new Error('Failed to store data in database');
+    }
+  }
+
+  async closeConnection() {
+    await this.sql.end();
+  }
+}
+
 export async function POST(request: NextRequest) {
+  let dbService: DatabaseService | null = null;
+
   try {
     const requestBody = await request.json();
 
+    // Validate input data
     const requiredCheck = DataValidator.checkRequiredFields(requestBody);
     if (requiredCheck) return requiredCheck;
 
@@ -181,29 +220,46 @@ export async function POST(request: NextRequest) {
     const authorValidation = DataValidator.inspectAuthorName(requestBody.author);
     if (authorValidation) return authorValidation;
 
-    console.log('Datos validados correctamente:', {
-      titulo: requestBody.title,
-      descripcion: requestBody.description,
-      autor: requestBody.author
+    // Store in database
+    dbService = new DatabaseService();
+    const submissionId = await dbService.storeSubmission({
+      title: requestBody.title.trim(),
+      description: requestBody.description.trim(),
+      author: requestBody.author.trim()
+    });
+
+    console.log('Data validation and storage successful:', {
+      id: submissionId,
+      title: requestBody.title,
+      description: requestBody.description,
+      author: requestBody.author
     });
 
     return NextResponse.json({
-      estado: 'éxito',
-      mensaje: 'Validación completada satisfactoriamente',
-      datos: {
-        titulo: requestBody.title,
-        descripcion: requestBody.description,
-        autor: requestBody.author
+      status: 'success',
+      message: 'Data validated and stored successfully',
+      submissionId: submissionId,
+      data: {
+        title: requestBody.title,
+        description: requestBody.description,
+        author: requestBody.author
       }
     });
 
   } catch (error) {
+    console.error('Processing error:', error);
+    
     return NextResponse.json(
       { 
-        error: 'Payload JSON inválido',
-        detalle: error instanceof Error ? error.message : 'Error desconocido'
+        error: 'Processing failed',
+        detail: error instanceof Error ? error.message : 'Unknown error'
       },
-      { status: 400 }
+      { status: 500 }
     );
+  } finally {
+    // Close database connection
+    if (dbService) {
+      await dbService.closeConnection();
+    }
   }
 }
