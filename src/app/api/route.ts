@@ -2,37 +2,145 @@ import { NextResponse, NextRequest } from 'next/server';
 import postgres from 'postgres';
 
 // Database connection configuration
-const DB_CONFIG = {
+interface DatabaseConfig {
+  connectionString: string;
+  schema: string;
+  tableName: string;
+}
+
+const DB_CONFIG: DatabaseConfig = {
   connectionString: 'postgresql://postgres.gymwtqibtytjbhqteoyt:ivferkiro112206@aws-1-us-east-2.pooler.supabase.com:6543/postgres',
-  tableName: 'submissions'
+  schema: 'public',
+  tableName: 'db_buenaspracticas'
 };
 
-class DataValidator {
-  static checkRequiredFields(payload: any) {
-    const mandatoryFields = ['title', 'description', 'author'];
-    const missingFields = mandatoryFields.filter(field => payload[field] === undefined);
-    
-    if (missingFields.length > 0) {
-      return NextResponse.json(
-        { 
-          error: 'Missing required fields',
-          missing: missingFields,
-          required: mandatoryFields 
-        },
-        { status: 400 }
-      );
-    }
-    return null;
+// Data interfaces
+interface SubmissionData {
+  title: string;
+  description: string;
+  author: string;
+}
+
+interface ValidationResult {
+  isValid: boolean;
+  error?: NextResponse;
+}
+
+interface DatabaseOperationResult {
+  success: boolean;
+  data?: any;
+  error?: string;
+}
+
+// Abstract database service
+abstract class DatabaseService {
+  protected sql: any;
+
+  constructor(connectionString: string) {
+    this.sql = postgres(connectionString);
   }
 
-  static verifyFieldTypes(payload: any) {
-    const typeRequirements = {
-      title: 'string',
-      description: 'string', 
-      author: 'string'
-    };
+  abstract executeQuery(query: string, params?: any[]): Promise<DatabaseOperationResult>;
+  abstract close(): Promise<void>;
+}
 
-    const typeMismatches = Object.entries(typeRequirements)
+// Concrete PostgreSQL implementation
+class PostgresService extends DatabaseService {
+  async executeQuery(query: string, params?: any[]): Promise<DatabaseOperationResult> {
+    try {
+      const result = await this.sql.unsafe(query, params);
+      return { success: true, data: result };
+    } catch (error) {
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : 'Unknown database error' 
+      };
+    }
+  }
+
+  async close(): Promise<void> {
+    await this.sql.end();
+  }
+}
+
+// Database repository for specific table operations
+class SubmissionRepository {
+  private dbService: DatabaseService;
+  private config: DatabaseConfig;
+
+  constructor(dbService: DatabaseService, config: DatabaseConfig) {
+    this.dbService = dbService;
+    this.config = config;
+  }
+
+  async ensureTableExists(): Promise<DatabaseOperationResult> {
+    const createTableQuery = `
+      CREATE TABLE IF NOT EXISTS ${this.config.schema}.${this.config.tableName} (
+        id SERIAL PRIMARY KEY,
+        title VARCHAR(255) NOT NULL,
+        description TEXT NOT NULL,
+        author VARCHAR(100) NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `;
+
+    return await this.dbService.executeQuery(createTableQuery);
+  }
+
+  async insertSubmission(data: SubmissionData): Promise<DatabaseOperationResult> {
+    const insertQuery = `
+      INSERT INTO ${this.config.schema}.${this.config.tableName} 
+        (title, description, author, created_at)
+      VALUES ($1, $2, $3, NOW())
+      RETURNING id
+    `;
+
+    const params = [data.title, data.description, data.author];
+    return await this.dbService.executeQuery(insertQuery, params);
+  }
+}
+
+// Validation strategies
+interface ValidationStrategy {
+  validate(data: any): ValidationResult;
+}
+
+class RequiredFieldsValidation implements ValidationStrategy {
+  private fields: string[];
+
+  constructor(fields: string[]) {
+    this.fields = fields;
+  }
+
+  validate(payload: any): ValidationResult {
+    const missingFields = this.fields.filter(field => payload[field] === undefined);
+    
+    if (missingFields.length > 0) {
+      return {
+        isValid: false,
+        error: NextResponse.json(
+          { 
+            error: 'Missing required fields',
+            missing: missingFields,
+            required: this.fields 
+          },
+          { status: 400 }
+        )
+      };
+    }
+    return { isValid: true };
+  }
+}
+
+class TypeValidation implements ValidationStrategy {
+  private fieldTypes: Record<string, string>;
+
+  constructor(fieldTypes: Record<string, string>) {
+    this.fieldTypes = fieldTypes;
+  }
+
+  validate(payload: any): ValidationResult {
+    const typeMismatches = Object.entries(this.fieldTypes)
       .filter(([field, expectedType]) => typeof payload[field] !== expectedType)
       .map(([field, expectedType]) => ({
         field,
@@ -41,238 +149,202 @@ class DataValidator {
       }));
 
     if (typeMismatches.length > 0) {
-      return NextResponse.json(
-        {
-          error: 'Invalid data types',
-          details: typeMismatches,
-          message: 'All fields must be strings'
-        },
-        { status: 400 }
-      );
+      return {
+        isValid: false,
+        error: NextResponse.json(
+          {
+            error: 'Invalid data types',
+            details: typeMismatches,
+            message: 'All fields must be strings'
+          },
+          { status: 400 }
+        )
+      };
     }
-    return null;
+    return { isValid: true };
+  }
+}
+
+class LengthValidation implements ValidationStrategy {
+  constructor(
+    private field: string,
+    private min: number,
+    private max: number,
+    private fieldName: string
+  ) {}
+
+  validate(payload: any): ValidationResult {
+    const value = payload[this.field]?.trim() || '';
+    const length = value.length;
+
+    if (length < this.min) {
+      return {
+        isValid: false,
+        error: NextResponse.json(
+          {
+            error: `${this.fieldName} too short`,
+            currentLength: length,
+            minimumRequired: this.min,
+            providedValue: payload[this.field]
+          },
+          { status: 400 }
+        )
+      };
+    }
+
+    if (length > this.max) {
+      return {
+        isValid: false,
+        error: NextResponse.json(
+          {
+            error: `${this.fieldName} exceeds maximum length`,
+            currentLength: length,
+            maximumAllowed: this.max,
+            providedValue: payload[this.field]
+          },
+          { status: 400 }
+        )
+      };
+    }
+
+    return { isValid: true };
+  }
+}
+
+// Validation orchestrator
+class ValidationOrchestrator {
+  private strategies: ValidationStrategy[];
+
+  constructor(strategies: ValidationStrategy[]) {
+    this.strategies = strategies;
   }
 
-  static evaluateTitle(titleValue: string) {
-    const cleanTitle = titleValue.trim();
-    const titleLength = cleanTitle.length;
-
-    if (titleLength < 5) {
-      return NextResponse.json(
-        {
-          error: 'Title too short',
-          currentLength: titleLength,
-          minimumRequired: 5,
-          providedValue: titleValue
-        },
-        { status: 400 }
-      );
+  validate(payload: any): ValidationResult {
+    for (const strategy of this.strategies) {
+      const result = strategy.validate(payload);
+      if (!result.isValid) {
+        return result;
+      }
     }
+    return { isValid: true };
+  }
+}
 
-    if (titleLength > 100) {
-      return NextResponse.json(
-        {
-          error: 'Title exceeds maximum length',
-          currentLength: titleLength,
-          maximumAllowed: 100,
-          providedValue: titleValue
-        },
-        { status: 400 }
-      );
-    }
-
-    return null;
+// Response factory
+class ResponseFactory {
+  static success(data: any, message: string = 'Operation completed successfully') {
+    return NextResponse.json({
+      status: 'success',
+      message,
+      data,
+      timestamp: new Date().toISOString()
+    });
   }
 
-  static assessDescription(descContent: string) {
-    const processedDesc = descContent.trim();
-    const descLength = processedDesc.length;
-
-    if (descLength === 0) {
-      return NextResponse.json(
-        {
-          error: 'Description cannot be empty',
-          providedValue: descContent
-        },
-        { status: 400 }
-      );
-    }
-
-    if (descLength < 5) {
-      return NextResponse.json(
-        {
-          error: 'Description too short',
-          currentCharacters: descLength,
-          requiredMinimum: 5,
-          missingCharacters: 5 - descLength
-        },
-        { status: 400 }
-      );
-    }
-
-    if (descLength > 1000) {
-      return NextResponse.json(
-        {
-          error: 'Description too long',
-          currentCharacters: descLength,
-          characterLimit: 1000,
-          excessCharacters: descLength - 1000
-        },
-        { status: 400 }
-      );
-    }
-
-    return null;
+  static error(message: string, details: any = {}, status: number = 500) {
+    return NextResponse.json({
+      status: 'error',
+      message,
+      details,
+      timestamp: new Date().toISOString()
+    }, { status });
   }
 
-  static inspectAuthorName(authorName: string) {
-    const validationIssues: string[] = [];
-    const namePatterns = {
-      capitalStart: /^[A-ZÁÉÍÓÚÑÜ]/,
-      validCharacters: /^[A-Za-záéíóúñü'\-. ]+$/,
-      nameFormat: /^[A-ZÁÉÍÓÚÑÜ][a-záéíóúñü'\-.]+(?:\s+[A-ZÁÉÍÓÚÑÜ][a-záéíóúñü'\-.]+)*$/
+  static validationError(errorDetails: any) {
+    return NextResponse.json({
+      status: 'validation_error',
+      ...errorDetails,
+      timestamp: new Date().toISOString()
+    }, { status: 400 });
+  }
+}
+
+// Main service orchestrator
+class SubmissionService {
+  private validationOrchestrator: ValidationOrchestrator;
+  private repository: SubmissionRepository;
+
+  constructor(validationOrchestrator: ValidationOrchestrator, repository: SubmissionRepository) {
+    this.validationOrchestrator = validationOrchestrator;
+    this.repository = repository;
+  }
+
+  async processSubmission(payload: any): Promise<NextResponse> {
+    // Validación
+    const validationResult = this.validationOrchestrator.validate(payload);
+    if (!validationResult.isValid) {
+      return validationResult.error!;
+    }
+
+    // Preparar datos
+    const submissionData: SubmissionData = {
+      title: payload.title.trim(),
+      description: payload.description.trim(),
+      author: payload.author.trim()
     };
 
-    if (!namePatterns.capitalStart.test(authorName)) {
-      validationIssues.push('Must start with capital letter');
+    // Asegurar que la tabla existe
+    const tableResult = await this.repository.ensureTableExists();
+    if (!tableResult.success) {
+      return ResponseFactory.error('Database table setup failed', { detail: tableResult.error });
     }
 
-    if (!namePatterns.validCharacters.test(authorName)) {
-      validationIssues.push('Contains invalid characters');
+    // Insertar datos
+    const insertResult = await this.repository.insertSubmission(submissionData);
+    if (!insertResult.success) {
+      return ResponseFactory.error('Database insertion failed', { detail: insertResult.error });
     }
 
-    if (!namePatterns.nameFormat.test(authorName)) {
-      validationIssues.push('Invalid name format');
-    }
-
-    if (authorName.replace(/[^a-záéíóúñü]/gi, '').length < 2) {
-      validationIssues.push('Name too short');
-    }
-
-    if (validationIssues.length > 0) {
-      return NextResponse.json(
-        {
-          error: 'Invalid author name',
-          detectedIssues: validationIssues,
-          providedName: authorName,
-          suggestions: [
-            'Use proper capitalization',
-            'Only use letters, spaces, hyphens, and apostrophes',
-            'Example: "John-Doe Smith"'
-          ]
-        },
-        { status: 400 }
-      );
-    }
-
-    return null;
+    // Respuesta exitosa
+    return ResponseFactory.success({
+      insertedId: insertResult.data[0].id,
+      submission: submissionData
+    }, 'Data validated and inserted successfully');
   }
 }
 
-class DatabaseService {
-  private sql: any;
+// Factory for service creation
+class ServiceFactory {
+  static createSubmissionService(config: DatabaseConfig): SubmissionService {
+    // Crear servicios de base de datos
+    const dbService = new PostgresService(config.connectionString);
+    const repository = new SubmissionRepository(dbService, config);
 
-  constructor() {
-    this.sql = postgres(DB_CONFIG.connectionString);
-  }
+    // Configurar validaciones
+    const validationStrategies: ValidationStrategy[] = [
+      new RequiredFieldsValidation(['title', 'description', 'author']),
+      new TypeValidation({ title: 'string', description: 'string', author: 'string' }),
+      new LengthValidation('title', 5, 100, 'Title'),
+      new LengthValidation('description', 5, 1000, 'Description'),
+      // Puedes agregar más validaciones aquí
+    ];
 
-  async storeSubmission(data: { title: string; description: string; author: string; }) {
-    try {
-      const result = await this.sql`
-        INSERT INTO ${this.sql(DB_CONFIG.tableName)} 
-          (title, description, author, created_at)
-        VALUES 
-          (${data.title}, ${data.description}, ${data.author}, NOW())
-        RETURNING id
-      `;
-      
-      return result[0].id;
-    } catch (error) {
-      console.error('Database insertion error:', error);
-      throw new Error('Failed to store data in database');
-    }
-  }
+    const validationOrchestrator = new ValidationOrchestrator(validationStrategies);
 
-  async closeConnection() {
-    await this.sql.end();
+    return new SubmissionService(validationOrchestrator, repository);
   }
 }
 
-// POST con validaciones + insert
+// Handler principal
 export async function POST(request: NextRequest) {
-  let dbService: DatabaseService | null = null;
+  let submissionService: SubmissionService | null = null;
 
   try {
     const requestBody = await request.json();
 
-    // Validaciones
-    const requiredCheck = DataValidator.checkRequiredFields(requestBody);
-    if (requiredCheck) return requiredCheck;
+    // Crear servicio usando factory
+    submissionService = ServiceFactory.createSubmissionService(DB_CONFIG);
 
-    const typeCheck = DataValidator.verifyFieldTypes(requestBody);
-    if (typeCheck) return typeCheck;
-
-    const titleValidation = DataValidator.evaluateTitle(requestBody.title);
-    if (titleValidation) return titleValidation;
-
-    const descValidation = DataValidator.assessDescription(requestBody.description);
-    if (descValidation) return descValidation;
-
-    const authorValidation = DataValidator.inspectAuthorName(requestBody.author);
-    if (authorValidation) return authorValidation;
-
-    // Insert en la BD
-    dbService = new DatabaseService();
-    const submissionId = await dbService.storeSubmission({
-      title: requestBody.title.trim(),
-      description: requestBody.description.trim(),
-      author: requestBody.author.trim()
-    });
-
-    return NextResponse.json({
-      status: 'success',
-      message: 'Data validated and stored successfully',
-      submissionId,
-      data: {
-        title: requestBody.title,
-        description: requestBody.description,
-        author: requestBody.author
-      }
-    });
+    // Procesar submission
+    return await submissionService.processSubmission(requestBody);
 
   } catch (error) {
-    return NextResponse.json(
-      { 
-        error: 'Processing failed',
-        detail: error instanceof Error ? error.message : 'Unknown error'
-      },
-      { status: 500 }
+    console.error('Unexpected error:', error);
+    
+    return ResponseFactory.error(
+      'Unexpected processing error',
+      { detail: error instanceof Error ? error.message : 'Unknown error' },
+      500
     );
-  } finally {
-    if (dbService) await dbService.closeConnection();
-  }
-}
-
-export async function GET() {
-  const dbService = new DatabaseService();
-  try {
-    const newId = await dbService.storeSubmission({
-      title: "Título de prueba",
-      description: "Descripción de prueba para GET",
-      author: "Pedro López"
-    });
-
-    return NextResponse.json({
-      status: 'ok',
-      message: 'Inserción directa realizada',
-      id: newId
-    });
-  } catch (error) {
-    return NextResponse.json(
-      { error: 'Falló el insert', detail: (error as Error).message },
-      { status: 500 }
-    );
-  } finally {
-    await dbService.closeConnection();
   }
 }
