@@ -198,13 +198,14 @@ class DatabaseService {
   }
 }
 
+// POST con validaciones + insert
 export async function POST(request: NextRequest) {
   let dbService: DatabaseService | null = null;
 
   try {
     const requestBody = await request.json();
 
-    // Validate input data
+    // Validaciones
     const requiredCheck = DataValidator.checkRequiredFields(requestBody);
     if (requiredCheck) return requiredCheck;
 
@@ -220,7 +221,7 @@ export async function POST(request: NextRequest) {
     const authorValidation = DataValidator.inspectAuthorName(requestBody.author);
     if (authorValidation) return authorValidation;
 
-    // Store in database
+    // Insert en la BD
     dbService = new DatabaseService();
     const submissionId = await dbService.storeSubmission({
       title: requestBody.title.trim(),
@@ -228,17 +229,10 @@ export async function POST(request: NextRequest) {
       author: requestBody.author.trim()
     });
 
-    console.log('Data validation and storage successful:', {
-      id: submissionId,
-      title: requestBody.title,
-      description: requestBody.description,
-      author: requestBody.author
-    });
-
     return NextResponse.json({
       status: 'success',
       message: 'Data validated and stored successfully',
-      submissionId: submissionId,
+      submissionId,
       data: {
         title: requestBody.title,
         description: requestBody.description,
@@ -247,8 +241,6 @@ export async function POST(request: NextRequest) {
     });
 
   } catch (error) {
-    console.error('Processing error:', error);
-    
     return NextResponse.json(
       { 
         error: 'Processing failed',
@@ -257,9 +249,30 @@ export async function POST(request: NextRequest) {
       { status: 500 }
     );
   } finally {
-    // Close database connection
-    if (dbService) {
-      await dbService.closeConnection();
-    }
+    if (dbService) await dbService.closeConnection();
+  }
+}
+
+export async function GET() {
+  const dbService = new DatabaseService();
+  try {
+    const newId = await dbService.storeSubmission({
+      title: "Título de prueba",
+      description: "Descripción de prueba para GET",
+      author: "Pedro López"
+    });
+
+    return NextResponse.json({
+      status: 'ok',
+      message: 'Inserción directa realizada',
+      id: newId
+    });
+  } catch (error) {
+    return NextResponse.json(
+      { error: 'Falló el insert', detail: (error as Error).message },
+      { status: 500 }
+    );
+  } finally {
+    await dbService.closeConnection();
   }
 }
