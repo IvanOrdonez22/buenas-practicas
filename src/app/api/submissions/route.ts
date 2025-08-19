@@ -1,7 +1,8 @@
 import { NextRequest } from 'next/server';
 import { DatabaseService } from '../lib/database';
-import { Validator } from '../lib/validation';
 import { ResponseHandler } from '../lib/responses';
+import { GeneralValidators } from '../lib/validation/generalValidator';
+import { TitleValidator, DescriptionValidator, AuthorValidator } from '../lib/validation';
 
 export async function POST(request: NextRequest) {
   let db: DatabaseService | null = null;
@@ -9,23 +10,27 @@ export async function POST(request: NextRequest) {
   try {
     const data = await request.json();
 
-    // Validaciones
-    const requiredCheck = Validator.validateRequiredFields(data, ['title', 'description', 'author']);
-    if (!requiredCheck.isValid) return requiredCheck.error;
+    // Validación de campos requeridos
+    const requiredCheck = GeneralValidators.validateRequiredFields(data, ['title', 'description', 'author']);
+    if (requiredCheck) return requiredCheck;
 
-    const typeCheck = Validator.validateFieldTypes(data, { 
-      title: 'string', description: 'string', author: 'string' 
+    // Validación de tipos de datos
+    const typeCheck = GeneralValidators.validateFieldTypes(data, { 
+      title: 'string', 
+      description: 'string', 
+      author: 'string' 
     });
-    if (!typeCheck.isValid) return typeCheck.error;
+    if (typeCheck) return typeCheck;
 
-    const titleCheck = Validator.validateLength(data.title, 5, 100, 'Title');
-    if (!titleCheck.isValid) return titleCheck.error;
+    // Validaciones específicas por campo
+    const titleValidation = TitleValidator.validate(data.title);
+    if (titleValidation) return titleValidation;
 
-    const descCheck = Validator.validateLength(data.description, 5, 1000, 'Description');
-    if (!descCheck.isValid) return descCheck.error;
+    const descriptionValidation = DescriptionValidator.validate(data.description);
+    if (descriptionValidation) return descriptionValidation;
 
-    const authorCheck = Validator.validateAuthorName(data.author);
-    if (!authorCheck.isValid) return authorCheck.error;
+    const authorValidation = AuthorValidator.validate(data.author);
+    if (authorValidation) return authorValidation;
 
     // Procesar datos
     const submissionData = {
@@ -41,11 +46,13 @@ export async function POST(request: NextRequest) {
 
     return ResponseHandler.success({
       id: insertedId,
-      ...submissionData
-    }, 'Data saved successfully');
+      title: submissionData.title,
+      description: submissionData.description,
+      author: submissionData.author
+    }, 'Data validated and saved successfully');
 
   } catch (error) {
-    console.error('Error:', error);
+    console.error('Server error:', error);
     return ResponseHandler.error(
       'Internal server error',
       500,
@@ -57,5 +64,8 @@ export async function POST(request: NextRequest) {
 }
 
 export async function GET() {
-  return ResponseHandler.success({}, 'API is working');
+  return ResponseHandler.success(
+    { endpoint: '/api/submissions', method: 'POST' },
+    'Submit data using POST method with title, description, and author fields'
+  );
 }
